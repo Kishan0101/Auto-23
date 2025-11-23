@@ -11,27 +11,36 @@ import json
 from urllib.parse import urlparse
 from flask import Flask, jsonify
 import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+import sys
 
 # ==================== CONFIG ====================
 INDIA_COUNTRY_FACET_ID = "c4f78be1a8f14da0ab49ce1162348a5e"
-# Use environment variables for deployment
 BACKEND_URL = os.environ.get('BACKEND_URL')
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not BACKEND_URL or not GEMINI_API_KEY:
-    logger = logging.getLogger(__name__)
-    logger.error("FATAL: BACKEND_URL or GEMINI_API_KEY environment variables not set.")
-    # Exit if critical environment variables are missing
-    exit()
-
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
-
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Add signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    logger.info('Gracefully shutting down...')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if not BACKEND_URL or not GEMINI_API_KEY:
+    logger.error("FATAL: BACKEND_URL or GEMINI_API_KEY environment variables not set.")
+    exit()
+
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
 
@@ -89,7 +98,6 @@ COMPANIES = [
     {"name": "Availity", "url": "https://availity.wd1.myworkdayjobs.com/Availity_Careers_India"},
     {"name": "Wells Fargo", "url": "https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs"},
     {"name": "Motorola Solutions", "url": "https://motorolasolutions.wd5.myworkdayjobs.com/Careers"},
-    {"name": "2020 Companies", "url": "https://2020companies.wd1.myworkdayjobs.com/External_Careers"},
     {"name": "Kyndryl", "url": "https://kyndryl.wd5.myworkdayjobs.com/KyndrylProfessionalCareers"},
     {"name": "IFF", "url": "https://iff.wd5.myworkdayjobs.com/en-US/iff_careers"},
     {"name": "Light & Wonder", "url": "https://lnw.wd5.myworkdayjobs.com/LightWonderExternalCareers"},
@@ -113,6 +121,9 @@ COMPANIES = [
 
 # ==================== GEMINI CONTENT GENERATION ====================
 def generate_content_with_gemini(job, company_name):
+    """
+    Generate comprehensive job content using Gemini API with retry logic
+    """
     title = job['title']
     location = job['location']
     experience = job['experience']
@@ -162,29 +173,37 @@ def generate_content_with_gemini(job, company_name):
     IMPORTANT: Format the content as continuous paragraphs without line breaks. Use HTML tags for formatting but ensure the final output has no line breaks in the HTML code itself.
     """
     
-    try:
-        model = genai.GenerativeModel('gemini-flash-latest')
-        response = model.generate_content(prompt)
-        
-        if response and response.text:
-            content = response.text.replace('\n', '').replace('\r', '')
-            return content
-        else:
-            logger.error("Empty response from Gemini API")
-            return None
-    except Exception as e:
-        logger.error(f"Error generating content with Gemini: {e}")
-        return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            model = genai.GenerativeModel('gemini-flash-latest')
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                # Remove line breaks from the generated content
+                content = response.text.replace('\n', '').replace('\r', '')
+                return content
+            else:
+                logger.error(f"Empty response from Gemini API (attempt {attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+        except Exception as e:
+            logger.error(f"Error generating content with Gemini (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+    
+    return None
 
 # ==================== HELPER FUNCTIONS ====================
 def get_company_logo(logo_url):
     try:
-        r = requests.head(logo_url, timeout=8)
+        r = requests.head(logo_url, timeout=5)
         return logo_url if r.status_code == 200 else None
     except:
         return None
 
 def is_location_in_india(location_text):
+    """Check if the job location is in India"""
     if not location_text:
         return False
     
@@ -304,17 +323,27 @@ def post_to_backend(job, company_name, logo_url):
         "posted_date": job['posted_date']
     }
 
-    for _ in range(3):
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            r = requests.post(BACKEND_URL, json=payload, timeout=15)
+            # Check if BACKEND_URL ends with a slash
+            backend_url = BACKEND_URL
+            if not backend_url.endswith('/'):
+                backend_url += '/'
+                
+            r = requests.post(backend_url, json=payload, timeout=15)
             if r.status_code == 201:
                 logger.info(f"Posted: {payload['title']}")
                 return True
             else:
                 logger.error(f"Failed to post: {r.status_code} - {r.text}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
         except Exception as e:
             logger.warning(f"Retry posting... {e}")
-            time.sleep(5)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
     return False
 
 # ==================== CORE SCRAPING FUNCTION ====================
@@ -342,10 +371,10 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
         try:
             payload_with_facet = payload.copy()
             payload_with_facet["appliedFacets"] = {"locationCountry": [INDIA_COUNTRY_FACET_ID]}
-            r = requests.post(endpoint, headers=headers, json=payload_with_facet, timeout=12)
+            r = requests.post(endpoint, headers=headers, json=payload_with_facet, timeout=10)
             
             if r.status_code == 400:
-                r = requests.post(endpoint, headers=headers, json=payload, timeout=12)
+                r = requests.post(endpoint, headers=headers, json=payload, timeout=10)
                 
             data = r.json()
         except Exception as e:
@@ -384,7 +413,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
 
             detail_url = f"https://{host}/wday/cxs/{tenant}/{site}{path}"
             try:
-                detail = requests.get(detail_url, headers=headers, timeout=10).json()
+                detail = requests.get(detail_url, headers=headers, timeout=5).json()
                 info = detail.get("jobPostingInfo", {})
                 desc_html = info.get("jobDescription", "")
                 desc = re.sub(r'<[^>]+>', '', desc_html)
@@ -415,7 +444,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
 
 # ==================== SINGLE JOB POSTING ====================
 def post_single_job():
-    """Post a single job from a random company"""
+    """Post a single job from a random company with optimized approach"""
     # Look for jobs posted in the last 3 days to increase chances of finding a job
     target_date = (datetime.date.today() - timedelta(days=3)).isoformat()
     logger.info(f"Posting a single job for {target_date}")
@@ -423,7 +452,7 @@ def post_single_job():
     existing_job_ids = set()
     try:
         logger.info("Fetching existing jobs to build duplicate cache...")
-        r = requests.get(BACKEND_URL, timeout=20)
+        r = requests.get(BACKEND_URL, timeout=10)
         if r.status_code == 200:
             posts = r.json().get('jobs', [])
             for post in posts:
@@ -435,32 +464,41 @@ def post_single_job():
     except Exception as e:
         logger.error(f"Failed to build duplicate cache. Proceeding with caution. Error: {e}")
 
-    random.shuffle(COMPANIES)
-    company = COMPANIES[0]
-    name = company["name"]
-    logger.info(f"Scraping {name} for a single job...")
-    jobs = fetch_past_jobs(name, company["url"], target_date)
-    
-    if not jobs:
-        logger.warning(f"No jobs found for {name}")
-        return {"status": "no_jobs", "company": name}
-    
-    job = random.choice(jobs)
-    
-    unique_job_id = f"{name}_{job['job_req_id']}"
-    if unique_job_id in existing_job_ids:
-        logger.info(f"Skipping duplicate job: {job['title']} at {name}")
-        return {"status": "duplicate", "title": job['title'], "company": name}
+    # Try up to 5 random companies to find a job
+    for _ in range(5):
+        random.shuffle(COMPANIES)
+        company = COMPANIES[0]
+        name = company["name"]
+        logger.info(f"Scraping {name} for a single job...")
+        
+        try:
+            jobs = fetch_past_jobs(name, company["url"], target_date)
+            
+            if not jobs:
+                logger.warning(f"No jobs found for {name}")
+                continue
+            
+            job = random.choice(jobs)
+            
+            unique_job_id = f"{name}_{job['job_req_id']}"
+            if unique_job_id in existing_job_ids:
+                logger.info(f"Skipping duplicate job: {job['title']} at {name}")
+                continue
 
-    logo = f"https://logo.clearbit.com/{name.lower().replace(' ', '')}.com"
-    logo = get_company_logo(logo)
+            logo = f"https://logo.clearbit.com/{name.lower().replace(' ', '')}.com"
+            logo = get_company_logo(logo)
 
-    if post_to_backend(job, name, logo):
-        logger.info(f"Successfully posted: {job['title']} at {name}")
-        return {"status": "success", "title": job['title'], "company": name}
-    else:
-        logger.error(f"Failed to post: {job['title']} at {name}")
-        return {"status": "failed", "title": job['title'], "company": name}
+            if post_to_backend(job, name, logo):
+                logger.info(f"Successfully posted: {job['title']} at {name}")
+                return {"status": "success", "title": job['title'], "company": name}
+            else:
+                logger.error(f"Failed to post: {job['title']} at {name}")
+                continue
+        except Exception as e:
+            logger.error(f"Error processing {name}: {e}")
+            continue
+    
+    return {"status": "no_jobs", "message": "No suitable jobs found after 5 attempts"}
 
 # ==================== MAIN SCRAPER ====================
 def run_scrape():
@@ -472,7 +510,7 @@ def run_scrape():
     existing_job_ids = set()
     try:
         logger.info("Fetching existing jobs to build duplicate cache...")
-        r = requests.get(BACKEND_URL, timeout=20)
+        r = requests.get(BACKEND_URL, timeout=10)
         if r.status_code == 200:
             posts = r.json().get('jobs', [])
             for post in posts:
@@ -501,7 +539,7 @@ def run_scrape():
             if post_to_backend(job, name, logo):
                 new_posts += 1
                 existing_job_ids.add(unique_job_id)
-                time.sleep(2)
+                time.sleep(1)  # Reduced sleep time
 
     logger.info(f"Completed! {new_posts} new jobs posted.")
     return {"status": "success", "new_posts": new_posts, "date": target_date}
@@ -520,7 +558,7 @@ def post_single_endpoint():
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "status": "Rich Content Scraper v4.0 Running on Render",
+        "status": "Rich Content Scraper v4.1 Running on Render",
         "features": ["100% Original Content", "1500+ Words", "SEO Optimized", "Duplicate Proof", "India Jobs Only", "Gemini AI Powered"],
         "scheduler": "Managed by Render Cron Jobs"
     })
