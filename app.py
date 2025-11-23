@@ -365,6 +365,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
     offset = 0
     limit = 20
     today = datetime.date.today()
+    target_date = datetime.date.fromisoformat(target_date_str)
 
     while True:
         payload = {"limit": limit, "offset": offset, "searchText": ""}
@@ -398,11 +399,10 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
             if "day" in posted_text.lower():
                 match = re.search(r"(\d+)", posted_text)
                 posted_delta = int(match.group(1)) if match else 0
-            posted_date = (today - timedelta(days=posted_delta)).isoformat()
-
-            if posted_date != target_date_str:
-                if posted_delta > 1:
-                    break
+            posted_date = (today - timedelta(days=posted_delta))
+            
+            # Include jobs posted within the last 3 days
+            if posted_date < target_date:
                 continue
 
             location_text = p.get("locationsText", "")
@@ -426,7 +426,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
                 "title": title,
                 "location": location_text,
                 "apply_link": apply_link,
-                "posted_date": posted_date,
+                "posted_date": posted_date.isoformat(),
                 "posted_text": posted_text,
                 "job_req_id": job_id,
                 "experience": "Not specified",
@@ -558,7 +558,7 @@ def post_single_endpoint():
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "status": "Rich Content Scraper v4.1 Running on Render",
+        "status": "Rich Content Scraper v4.2 Running on Render",
         "features": ["100% Original Content", "1500+ Words", "SEO Optimized", "Duplicate Proof", "India Jobs Only", "Gemini AI Powered"],
         "scheduler": "Managed by Render Cron Jobs"
     })
