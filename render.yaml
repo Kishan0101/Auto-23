@@ -1,0 +1,25 @@
+services:
+  # ==================== WEB SERVICE ====================
+  - type: web
+    name: job-scraper-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    # This links the environment variables from your Render dashboard
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false # Set this value in the Render dashboard
+      - key: BACKEND_URL
+        sync: false # Set this value in the Render dashboard
+
+  # ==================== CRON JOB ====================
+  - type: cron
+    name: job-scraper-cron
+    # Schedule: Every minute from 6:00 AM to 9:30 PM IST
+    # IST is UTC+5.5. 6:00 AM IST = 00:30 UTC. 9:30 PM IST = 16:00 UTC.
+    # Cron runs from hour 0 to 15 UTC.
+    schedule: '* 0-15 * * *'
+    scheduleTZ: UTC
+    # This command calls the web service's endpoint
+    # RENDER_SERVICE_HOSTNAME is a special variable that resolves to the web service URL
+    startCommand: curl -X GET https://${RENDER_SERVICE_HOSTNAME}/post-single
