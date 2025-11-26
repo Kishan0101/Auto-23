@@ -11,36 +11,24 @@ import json
 from urllib.parse import urlparse
 from flask import Flask, jsonify
 import google.generativeai as genai
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import signal
-import sys
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+import atexit
 
 # ==================== CONFIG ====================
 INDIA_COUNTRY_FACET_ID = "c4f78be1a8f14da0ab49ce1162348a5e"
 BACKEND_URL = os.environ.get('BACKEND_URL')
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Configure logging
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Add signal handler for graceful shutdown
-def signal_handler(sig, frame):
-    logger.info('Gracefully shutting down...')
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-if not BACKEND_URL or not GEMINI_API_KEY:
-    logger.error("FATAL: BACKEND_URL or GEMINI_API_KEY environment variables not set.")
-    exit()
-
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
 
@@ -98,9 +86,15 @@ COMPANIES = [
     {"name": "Availity", "url": "https://availity.wd1.myworkdayjobs.com/Availity_Careers_India"},
     {"name": "Wells Fargo", "url": "https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs"},
     {"name": "Motorola Solutions", "url": "https://motorolasolutions.wd5.myworkdayjobs.com/Careers"},
+    {"name": "2020 Companies", "url": "https://2020companies.wd1.myworkdayjobs.com/External_Careers"},
     {"name": "Kyndryl", "url": "https://kyndryl.wd5.myworkdayjobs.com/KyndrylProfessionalCareers"},
     {"name": "IFF", "url": "https://iff.wd5.myworkdayjobs.com/en-US/iff_careers"},
     {"name": "Light & Wonder", "url": "https://lnw.wd5.myworkdayjobs.com/LightWonderExternalCareers"},
+
+    # -------------------------------
+    # New Companies Added Below
+    # -------------------------------
+
     {"name": "Bristol Myers Squibb", "url": "https://bristolmyerssquibb.wd5.myworkdayjobs.com/BMS"},
     {"name": "Alcon", "url": "https://alcon.wd5.myworkdayjobs.com/careers_alcon"},
     {"name": "DXC Technology", "url": "https://dxctechnology.wd1.myworkdayjobs.com/DXCJobs"},
@@ -122,7 +116,7 @@ COMPANIES = [
 # ==================== GEMINI CONTENT GENERATION ====================
 def generate_content_with_gemini(job, company_name):
     """
-    Generate comprehensive job content using Gemini API with retry logic
+    Generate comprehensive job content using Gemini API
     """
     title = job['title']
     location = job['location']
@@ -173,31 +167,25 @@ def generate_content_with_gemini(job, company_name):
     IMPORTANT: Format the content as continuous paragraphs without line breaks. Use HTML tags for formatting but ensure the final output has no line breaks in the HTML code itself.
     """
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            model = genai.GenerativeModel('gemini-flash-latest')
-            response = model.generate_content(prompt)
-            
-            if response and response.text:
-                # Remove line breaks from the generated content
-                content = response.text.replace('\n', '').replace('\r', '')
-                return content
-            else:
-                logger.error(f"Empty response from Gemini API (attempt {attempt+1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-        except Exception as e:
-            logger.error(f"Error generating content with Gemini (attempt {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-    
-    return None
+    try:
+        model = genai.GenerativeModel('gemini-flash-latest')
+        response = model.generate_content(prompt)
+        
+        if response and response.text:
+            # Remove line breaks from the generated content
+            content = response.text.replace('\n', '').replace('\r', '')
+            return content
+        else:
+            logger.error("Empty response from Gemini API")
+            return None
+    except Exception as e:
+        logger.error(f"Error generating content with Gemini: {e}")
+        return None
 
 # ==================== HELPER FUNCTIONS ====================
 def get_company_logo(logo_url):
     try:
-        r = requests.head(logo_url, timeout=5)
+        r = requests.head(logo_url, timeout=8)
         return logo_url if r.status_code == 200 else None
     except:
         return None
@@ -260,10 +248,13 @@ def generate_rich_content(job, company_name):
         footer = f"<p><small>Posted on: {job['posted_text']} | Last updated: {datetime.date.today().strftime('%B %d, %Y')} | Source: {company_name} Official Careers</small></p>"
         
         full_content = job_details + content + apply_button + footer
+        # Remove any line breaks from the final content
         return full_content.replace('\n', '').replace('\r', '')
     else:
         logger.warning(f"Gemini API failed for {title} at {company_name}. Using fallback content.")
         skills = job['skills'][:6] if job['skills'] else ["Teamwork", "Communication", "Problem Solving"]
+        is_fresher = 'fresher' in job.get('exp', '').lower() or '0' in exp or 'entry' in exp.lower()
+        fresher_answer = "Yes! Freshers are encouraged to apply." if is_fresher else "No, relevant experience is required."
 
         content = f"<h1>{title} - {company_name} Hiring in India</h1>"
         content += f"<p><strong>Location:</strong> {location} | <strong>Experience:</strong> {exp} | <strong>Job Type:</strong> {time_type} | <strong>Mode:</strong> {remote}</strong></p>"
@@ -283,6 +274,7 @@ def generate_rich_content(job, company_name):
         content += "</div>"
         content += f"<p><small>Posted on: {job['posted_text']} | Last updated: {datetime.date.today().strftime('%B %d, %Y')} | Source: {company_name} Official Careers</small></p>"
         
+        # Remove any line breaks from the final content
         return content.replace('\n', '').replace('\r', '')
 
 def post_to_backend(job, company_name, logo_url):
@@ -323,27 +315,17 @@ def post_to_backend(job, company_name, logo_url):
         "posted_date": job['posted_date']
     }
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    for _ in range(3):
         try:
-            # Check if BACKEND_URL ends with a slash
-            backend_url = BACKEND_URL
-            if not backend_url.endswith('/'):
-                backend_url += '/'
-                
-            r = requests.post(backend_url, json=payload, timeout=15)
+            r = requests.post(BACKEND_URL, json=payload, timeout=15)
             if r.status_code == 201:
                 logger.info(f"Posted: {payload['title']}")
                 return True
             else:
                 logger.error(f"Failed to post: {r.status_code} - {r.text}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
         except Exception as e:
             logger.warning(f"Retry posting... {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-                
+            time.sleep(5)
     return False
 
 # ==================== CORE SCRAPING FUNCTION ====================
@@ -365,17 +347,16 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
     offset = 0
     limit = 20
     today = datetime.date.today()
-    target_date = datetime.date.fromisoformat(target_date_str)
 
     while True:
         payload = {"limit": limit, "offset": offset, "searchText": ""}
         try:
             payload_with_facet = payload.copy()
             payload_with_facet["appliedFacets"] = {"locationCountry": [INDIA_COUNTRY_FACET_ID]}
-            r = requests.post(endpoint, headers=headers, json=payload_with_facet, timeout=10)
+            r = requests.post(endpoint, headers=headers, json=payload_with_facet, timeout=12)
             
             if r.status_code == 400:
-                r = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+                r = requests.post(endpoint, headers=headers, json=payload, timeout=12)
                 
             data = r.json()
         except Exception as e:
@@ -399,10 +380,11 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
             if "day" in posted_text.lower():
                 match = re.search(r"(\d+)", posted_text)
                 posted_delta = int(match.group(1)) if match else 0
-            posted_date = (today - timedelta(days=posted_delta))
-            
-            # Include jobs posted within the last 3 days
-            if posted_date < target_date:
+            posted_date = (today - timedelta(days=posted_delta)).isoformat()
+
+            if posted_date != target_date_str:
+                if posted_delta > 1:
+                    break
                 continue
 
             location_text = p.get("locationsText", "")
@@ -413,7 +395,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
 
             detail_url = f"https://{host}/wday/cxs/{tenant}/{site}{path}"
             try:
-                detail = requests.get(detail_url, headers=headers, timeout=5).json()
+                detail = requests.get(detail_url, headers=headers, timeout=10).json()
                 info = detail.get("jobPostingInfo", {})
                 desc_html = info.get("jobDescription", "")
                 desc = re.sub(r'<[^>]+>', '', desc_html)
@@ -426,7 +408,7 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
                 "title": title,
                 "location": location_text,
                 "apply_link": apply_link,
-                "posted_date": posted_date.isoformat(),
+                "posted_date": posted_date,
                 "posted_text": posted_text,
                 "job_req_id": job_id,
                 "experience": "Not specified",
@@ -442,64 +424,6 @@ def fetch_past_jobs(company_name, base_url, target_date_str):
 
     return jobs
 
-# ==================== SINGLE JOB POSTING ====================
-def post_single_job():
-    """Post a single job from a random company with optimized approach"""
-    # Look for jobs posted in the last 3 days to increase chances of finding a job
-    target_date = (datetime.date.today() - timedelta(days=3)).isoformat()
-    logger.info(f"Posting a single job for {target_date}")
-    
-    existing_job_ids = set()
-    try:
-        logger.info("Fetching existing jobs to build duplicate cache...")
-        r = requests.get(BACKEND_URL, timeout=10)
-        if r.status_code == 200:
-            posts = r.json().get('jobs', [])
-            for post in posts:
-                job_id = post.get('job_req_id')
-                company = post.get('company_name')
-                if job_id and company:
-                    existing_job_ids.add(f"{company}_{job_id}")
-        logger.info(f"Cache built with {len(existing_job_ids)} existing jobs.")
-    except Exception as e:
-        logger.error(f"Failed to build duplicate cache. Proceeding with caution. Error: {e}")
-
-    # Try up to 5 random companies to find a job
-    for _ in range(5):
-        random.shuffle(COMPANIES)
-        company = COMPANIES[0]
-        name = company["name"]
-        logger.info(f"Scraping {name} for a single job...")
-        
-        try:
-            jobs = fetch_past_jobs(name, company["url"], target_date)
-            
-            if not jobs:
-                logger.warning(f"No jobs found for {name}")
-                continue
-            
-            job = random.choice(jobs)
-            
-            unique_job_id = f"{name}_{job['job_req_id']}"
-            if unique_job_id in existing_job_ids:
-                logger.info(f"Skipping duplicate job: {job['title']} at {name}")
-                continue
-
-            logo = f"https://logo.clearbit.com/{name.lower().replace(' ', '')}.com"
-            logo = get_company_logo(logo)
-
-            if post_to_backend(job, name, logo):
-                logger.info(f"Successfully posted: {job['title']} at {name}")
-                return {"status": "success", "title": job['title'], "company": name}
-            else:
-                logger.error(f"Failed to post: {job['title']} at {name}")
-                continue
-        except Exception as e:
-            logger.error(f"Error processing {name}: {e}")
-            continue
-    
-    return {"status": "no_jobs", "message": "No suitable jobs found after 5 attempts"}
-
 # ==================== MAIN SCRAPER ====================
 def run_scrape():
     target_date = datetime.date.today().isoformat()
@@ -507,10 +431,12 @@ def run_scrape():
     new_posts = 0
     random.shuffle(COMPANIES)
 
+    # --- ROBUST DUPLICATE CHECKING ---
+    # 1. Fetch all existing jobs once to build a cache of seen job IDs
     existing_job_ids = set()
     try:
         logger.info("Fetching existing jobs to build duplicate cache...")
-        r = requests.get(BACKEND_URL, timeout=10)
+        r = requests.get(BACKEND_URL, timeout=20)
         if r.status_code == 200:
             posts = r.json().get('jobs', [])
             for post in posts:
@@ -528,6 +454,7 @@ def run_scrape():
         jobs = fetch_past_jobs(name, comp["url"], target_date)
 
         for job in jobs:
+            # --- EFFICIENT DUPLICATE CHECK ---
             unique_job_id = f"{name}_{job['job_req_id']}"
             if unique_job_id in existing_job_ids:
                 logger.info(f"Skipping duplicate job: {job['title']} at {name}")
@@ -538,11 +465,50 @@ def run_scrape():
 
             if post_to_backend(job, name, logo):
                 new_posts += 1
+                # Add to cache after successful post to prevent re-posting in the same run
                 existing_job_ids.add(unique_job_id)
-                time.sleep(1)  # Reduced sleep time
+                time.sleep(2)
 
     logger.info(f"Completed! {new_posts} new jobs posted.")
     return {"status": "success", "new_posts": new_posts, "date": target_date}
+
+# ==================== SCHEDULER SETUP ====================
+def setup_scheduler():
+    scheduler = BackgroundScheduler()
+    
+    # Run every minute
+    scheduler.add_job(
+        func=run_scrape,
+        trigger=IntervalTrigger(minutes=1),
+        id='every_minute_job',
+        name='Run job scraping every minute',
+        replace_existing=True
+    )
+    
+    # Run at 6 AM every day
+    scheduler.add_job(
+        func=run_scrape,
+        trigger=CronTrigger(hour=6, minute=0),
+        id='daily_6am_job',
+        name='Run job scraping at 6 AM daily',
+        replace_existing=True
+    )
+    
+    # Run at 9:30 PM every day
+    scheduler.add_job(
+        func=run_scrape,
+        trigger=CronTrigger(hour=21, minute=30),
+        id='daily_930pm_job',
+        name='Run job scraping at 9:30 PM daily',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    
+    # Shut down the scheduler when exiting the app
+    atexit.register(lambda: scheduler.shutdown())
+    
+    return scheduler
 
 # ==================== FLASK ROUTES ====================
 @app.route('/scrape', methods=['GET'])
@@ -550,19 +516,25 @@ def scrape_endpoint():
     result = run_scrape()
     return jsonify(result)
 
-@app.route('/post-single', methods=['GET'])
-def post_single_endpoint():
-    result = post_single_job()
-    return jsonify(result)
-
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "status": "Rich Content Scraper v4.2 Running on Render",
-        "features": ["100% Original Content", "1500+ Words", "SEO Optimized", "Duplicate Proof", "India Jobs Only", "Gemini AI Powered"],
-        "scheduler": "Managed by Render Cron Jobs"
+        "status": "Rich Content Scraper v3.1 Running",
+        "features": ["100% Original Content", "1500+ Words", "SEO Optimized", "Duplicate Proof", "India Jobs Only", "Gemini AI Powered", "Automated Scheduling"]
     })
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.datetime.now().isoformat()})
+
 if __name__ == '__main__':
-    # This is for local development only. Render uses gunicorn.
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
+    # Start the scheduler
+    scheduler = setup_scheduler()
+    
+    # Run an initial scrape when the app starts
+    logger.info("Running initial scrape on startup...")
+    run_scrape()
+    
+    # Start the Flask app
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
