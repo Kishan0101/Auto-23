@@ -1,42 +1,12 @@
 services:
-  # ==================== WEB SERVICE ====================
   - type: web
-    name: job-scraper-api
+    name: job-scraper
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 120 --workers 1 --max-requests 1000 --max-requests-jitter 50 --preload
-    healthCheckPath: /
-    healthCheckTimeout: 30
-    healthCheckInterval: 30
-    autoDeploy: true
-    # Environment variables - Set these in Render dashboard for security
+    startCommand: python app.py
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false  # Set this value in Render dashboard
       - key: BACKEND_URL
-        sync: false  # Set this value in Render dashboard
-      - key: LOG_LEVEL
-        value: INFO
-      - key: PYTHON_VERSION
-        value: 3.9
-      - key: PORT
-        value: 5000
-
-  # ==================== CRON JOB ====================
-  - type: cron
-    name: job-scraper-cron
-    # Schedule: Every 5 minutes from 6:00 AM to 9:30 PM IST
-    # IST is UTC+5.5. 6:00 AM IST = 00:30 UTC. 9:30 PM IST = 16:00 UTC.
-    # Cron runs from hour 0 to 15 UTC.
-    schedule: '*/5 0-15 * * *'
-    scheduleTZ: UTC
-    # This command calls the web service's endpoint
-    # RENDER_SERVICE_HOSTNAME is a special variable that resolves to the web service URL
-    startCommand: curl -X GET https://${RENDER_SERVICE_HOSTNAME}/post-single --fail --silent --show-error --max-time 60
-    # Retry configuration
-    retryCount: 3
-    retryDelay: 10
-
-# ==================== RENDER GLOBAL SETTINGS ====================
-# Global settings for all services
-version: "1"
+        value: https://autoback-781i.vercel.app/posts
+      - key: GEMINI_API_KEY
+        sync: false
