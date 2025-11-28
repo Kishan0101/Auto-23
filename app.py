@@ -514,10 +514,6 @@ def setup_scheduler():
     return scheduler
 
 # ==================== FLASK ROUTES ====================
-@app.before_first_request
-def initialize():
-    logger.info("Application starting up...")
-
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
     result = run_scrape()
@@ -541,6 +537,9 @@ def ready():
 
 # ==================== MAIN EXECUTION ====================
 if __name__ == '__main__':
+    # Log application startup
+    logger.info("Application starting up...")
+    
     # Start the scheduler
     scheduler = setup_scheduler()
     
