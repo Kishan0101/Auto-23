@@ -22,7 +22,10 @@ BACKEND_URL = os.environ.get('BACKEND_URL')
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("WARNING: GEMINI_API_KEY not found in environment variables")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -511,6 +514,10 @@ def setup_scheduler():
     return scheduler
 
 # ==================== FLASK ROUTES ====================
+@app.before_first_request
+def initialize():
+    logger.info("Application starting up...")
+
 @app.route('/scrape', methods=['GET'])
 def scrape_endpoint():
     result = run_scrape()
@@ -527,6 +534,12 @@ def home():
 def health_check():
     return jsonify({"status": "healthy", "timestamp": datetime.datetime.now().isoformat()})
 
+@app.route('/ready', methods=['GET'])
+def ready():
+    """Readiness probe endpoint for deployment platforms"""
+    return "OK", 200
+
+# ==================== MAIN EXECUTION ====================
 if __name__ == '__main__':
     # Start the scheduler
     scheduler = setup_scheduler()
@@ -535,6 +548,11 @@ if __name__ == '__main__':
     logger.info("Running initial scrape on startup...")
     run_scrape()
     
-    # Start the Flask app
+    # Get port from environment variable with fallback to 5000
     port = int(os.environ.get('PORT', 5000))
+    
+    # Log the port for debugging
+    logger.info(f"Starting Flask app on port {port}")
+    
+    # Start the Flask app with proper port binding
     app.run(host='0.0.0.0', port=port, debug=False)
